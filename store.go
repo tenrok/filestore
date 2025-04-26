@@ -19,22 +19,13 @@ const tmpfileName = "<temporary file>"
 
 // Store описывает хранилище файлов.
 type Store struct {
-	root string
+	dir string
 
 	mutexes struct {
 		sync.Mutex
 		sync.Once
 		m map[string]*sync.Mutex
 	}
-}
-
-// Open открывает и возвращает хранилище файлов.
-func Open(root string) (*Store, error) {
-	// Создаём каталог, если он ещё не создан
-	if err := os.MkdirAll(root, 0700); err != nil {
-		return nil, err
-	}
-	return &Store{root: root}, nil
 }
 
 // FileInfo описывает информацию о сохраненном файле.
@@ -47,24 +38,23 @@ type FileInfo struct {
 	MD5      string `json:"md5"`
 }
 
-// Create сохраняет файл в хранилище. В качестве имени файла используется комбинация из двух хешей. Файл сохраняется в подкаталоге prefix,
-// если он задан, но данный prefix не учитывается в возвращаемой информации в имени файла.
-func (s *Store) Create(prefix string, r io.Reader) (*FileInfo, error) {
-	// Добавляем префикс к корню и создаём каталог
-	root := filepath.Join(s.root, prefix)
-	if err := os.MkdirAll(root, 0700); err != nil {
+// NewStore открывает и возвращает хранилище файлов.
+func NewStore(dir string) (*Store, error) {
+	// Создаём каталог, если он ещё не создан
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
+	return &Store{dir: dir}, nil
+}
 
+// Create сохраняет файл в хранилище. В качестве имени файла используется комбинация из двух хешей.
+func (s *Store) Create(r io.Reader) (*FileInfo, error) {
 	// Создаём временный файл в корневом каталоге
-	tmpfile, err := os.CreateTemp(root, "~tmp")
+	tmpfile, err := os.CreateTemp(s.dir, "~tmp")
 	if err != nil {
-		err.(*os.PathError).Path = tmpfileName // Подменяем имя файла
+		err.(*os.PathError).Path = tmpfileName // Подмениваем имя файла
 		return nil, err
 	}
-
-	// В любом случае временный файл должен быть удален, если он не был переименован, т.е. на момент окончания функции существует под
-	// временным именем
 	defer os.Remove(tmpfile.Name())
 
 	// Копируем содержимое во временный файл
@@ -77,7 +67,7 @@ func (s *Store) Create(prefix string, r io.Reader) (*FileInfo, error) {
 		err = &os.PathError{Op: "create", Path: tmpfileName, Err: err}
 		return nil, err
 	}
-	mimetype := http.DetectContentType(data) // Определяем тип содержимого
+	mimetype := http.DetectContentType(data)
 
 	// Одновременно с сохранением в файл считаем две хеш-суммы
 	hashCRC32, hashMD5 := crc32.NewIEEE(), md5.New()
@@ -92,7 +82,7 @@ func (s *Store) Create(prefix string, r io.Reader) (*FileInfo, error) {
 	sumMD5 := hashMD5.Sum(nil)
 	name := base32.StdEncoding.EncodeToString(append(hashCRC32.Sum(nil), sumMD5...))
 	fi := &FileInfo{
-		Location: s.GetFullName(prefix, name),
+		Location: s.GetFullName(name),
 		Name:     name,
 		Mimetype: mimetype,
 		Size:     size,
@@ -133,9 +123,9 @@ func (s *Store) Create(prefix string, r io.Reader) (*FileInfo, error) {
 }
 
 // Open открывает файл из каталога.
-func (s *Store) Open(prefix, name string) (*os.File, error) {
+func (s *Store) Open(name string) (*os.File, error) {
 	// Полное имя для доступа к файлу
-	fullName := s.GetFullName(prefix, name)
+	fullName := s.GetFullName(name)
 	if fullName == "" {
 		return nil, os.ErrNotExist
 	}
@@ -169,13 +159,13 @@ func (s *Store) Open(prefix, name string) (*os.File, error) {
 }
 
 // Remove удаляет файл из хранилища.
-func (s *Store) Remove(prefix, name string) error {
+func (s *Store) Remove(name string) error {
 	mu := s.getMutex(name)
 	mu.Lock()
 	defer mu.Unlock()
 
 	// Полное имя для доступа к файлу
-	fullName := s.GetFullName(prefix, name)
+	fullName := s.GetFullName(name)
 	if fullName == "" {
 		return os.ErrNotExist
 	}
@@ -186,7 +176,7 @@ func (s *Store) Remove(prefix, name string) error {
 	}
 
 	// Пытаемся удалить пустые каталоги, если они образовались
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		fullName = filepath.Dir(fullName)
 		if err := os.Remove(fullName); err != nil {
 			break // Если не получилось, значит каталог не пустой
@@ -200,7 +190,7 @@ func (s *Store) Remove(prefix, name string) error {
 func (s *Store) Clean(lifetime time.Duration) error {
 	// Удаляем вообще все файлы, если время жизни не задано
 	if lifetime <= 0 {
-		files, err := filepath.Glob(filepath.Join(s.root, "*"))
+		files, err := filepath.Glob(filepath.Join(s.dir, "*"))
 		if err != nil {
 			return err
 		}
@@ -214,7 +204,7 @@ func (s *Store) Clean(lifetime time.Duration) error {
 	// Вычисляем крайнюю дату валидности файлов
 	valid := time.Now().Add(-lifetime)
 
-	err := filepath.Walk(s.root,
+	err := filepath.Walk(s.dir,
 		func(filename string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
@@ -231,7 +221,7 @@ func (s *Store) Clean(lifetime time.Duration) error {
 			}
 
 			// Пытаемся удалить пустые каталоги
-			for i := 0; i < 2; i++ {
+			for range 2 {
 				filename = filepath.Dir(filename)
 				if err = os.Remove(filename); err != nil {
 					break // Каталог не пустой
@@ -265,17 +255,16 @@ func (s *Store) getMutex(name string) *sync.Mutex {
 }
 
 // GetFullName возвращает полный путь к файлу в хранилище.
-func (s *Store) GetFullName(prefix, name string) string {
+func (s *Store) GetFullName(name string) string {
 	if len(name) < 27 {
 		return ""
 	}
-	return filepath.Join(s.root, prefix, name[:1], name[1:3], name[3:])
+	return filepath.Join(s.dir, name[:1], name[1:3], name[3:])
 }
 
 // IsExists проверяет: существует ли файл в хранилище?
-func (s *Store) IsExists(prefix, name string) bool {
-	// Полное имя файла
-	fullName := s.GetFullName(prefix, name)
+func (s *Store) IsExists(name string) bool {
+	fullName := s.GetFullName(name)
 	if fullName == "" {
 		return false
 	}
