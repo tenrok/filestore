@@ -12,7 +12,7 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
-	"filestore/remote"
+	"github.com/tenrok/filestore/remote"
 )
 
 const defaultFileMode = 0o755
