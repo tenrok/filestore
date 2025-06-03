@@ -19,12 +19,22 @@ const tmpfileName = "<temporary file>"
 
 // Store описывает хранилище файлов.
 type Store struct {
-	dir string
+	dir         string
+	permissions os.FileMode
 
 	mutexes struct {
 		sync.Mutex
 		sync.Once
 		m map[string]*sync.Mutex
+	}
+}
+
+type StoreOption func(*Store)
+
+// WithPermissions
+func WithPermissions(permissions os.FileMode) StoreOption {
+	return func(store *Store) {
+		store.permissions = permissions
 	}
 }
 
@@ -39,12 +49,24 @@ type FileInfo struct {
 }
 
 // NewStore открывает и возвращает хранилище файлов.
-func NewStore(dir string) (*Store, error) {
+func NewStore(dir string, opts ...StoreOption) (*Store, error) {
+	s := &Store{
+		dir:         dir,
+		permissions: 0700,
+	}
+
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+
 	// Создаём каталог, если он ещё не создан
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := os.MkdirAll(s.dir, s.permissions); err != nil {
 		return nil, err
 	}
-	return &Store{dir: dir}, nil
+
+	return s, nil
 }
 
 // Create сохраняет файл в хранилище. В качестве имени файла используется комбинация из двух хешей.
@@ -105,7 +127,7 @@ func (s *Store) Create(r io.Reader) (*FileInfo, error) {
 	}
 
 	// Если такого файла нет, то создаем для него каталог
-	if err := os.MkdirAll(filepath.Dir(fi.Location), 0700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(fi.Location), s.permissions); err != nil {
 		err.(*os.PathError).Path = fi.Name
 		return nil, err
 	}

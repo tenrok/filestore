@@ -14,36 +14,41 @@ type HttpFS struct {
 	remoteStorage remote.Storage
 }
 
-type Option func(*HttpFS)
+type HttpFSOption func(*HttpFS)
 
 // WithRemoteStorage
-func WithRemoteStorage(storage remote.Storage) Option {
+func WithRemoteStorage(storage remote.Storage) HttpFSOption {
 	return func(httpFS *HttpFS) {
 		httpFS.remoteStorage = storage
 	}
 }
 
 // NewHttpFS
-func NewHttpFS(dir string, opts ...Option) (*HttpFS, error) {
+func NewHttpFS(dir string, opts ...HttpFSOption) (*HttpFS, error) {
 	store, err := NewStore(dir)
 	if err != nil {
 		return nil, err
 	}
+
 	f := &HttpFS{store: store}
+
 	for _, opt := range opts {
 		if opt != nil {
 			opt(f)
 		}
 	}
+
 	return f, nil
 }
 
 // Open
 func (f *HttpFS) Open(name string) (http.File, error) {
 	n := strings.TrimPrefix(name, "/")
+
 	if f.remoteStorage != nil {
 		return f.remoteStorage.Open(name)
 	}
+
 	return f.store.Open(n)
 }
 
