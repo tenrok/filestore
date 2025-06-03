@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/tenrok/filestore/remote"
+	"filestore/remote"
 )
 
 var _ http.FileSystem = (*HttpFS)(nil)

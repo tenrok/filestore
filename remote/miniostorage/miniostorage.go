@@ -11,7 +11,8 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	"github.com/tenrok/filestore/remote"
+
+	"filestore/remote"
 )
 
 const defaultFileMode = 0o755

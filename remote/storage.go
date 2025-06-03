@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"sync"
 )
 
@@ -14,13 +15,13 @@ var (
 
 type Storage interface {
 	NewStorage(ctx context.Context, connString string) (Storage, error)
-	// Create(name string) (http.File, error)
+	Create(name string) (http.File, error)
 	Open(name string) (http.File, error)
-	// OpenFile(name string, flag int, fileMode os.FileMode) (http.File, error)
-	// Remove(name string) error
-	// RemoveAll(path string) error
-	// Rename(oldName, newName string) error
-	// Stat(name string) (os.FileInfo, error)
+	OpenFile(name string, flag int, fileMode os.FileMode) (http.File, error)
+	Remove(name string) error
+	RemoveAll(path string) error
+	Rename(oldName, newName string) error
+	Stat(name string) (os.FileInfo, error)
 }
 
 // NewStorage returns a new remote storage instance.
