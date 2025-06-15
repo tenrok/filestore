@@ -3,7 +3,8 @@ package remote
 import (
 	"context"
 	"fmt"
-	"net/http"
+	"io"
+	"io/fs"
 	"os"
 	"sync"
 )
@@ -13,11 +14,20 @@ var (
 	storages   = make(map[string]Storage)
 )
 
+type File interface {
+	io.Closer
+	io.Reader
+	io.Seeker
+	io.Writer
+	Readdir(count int) ([]fs.FileInfo, error)
+	Stat() (fs.FileInfo, error)
+}
+
 type Storage interface {
 	NewStorage(ctx context.Context, connString string) (Storage, error)
-	Create(name string) (http.File, error)
-	Open(name string) (http.File, error)
-	OpenFile(name string, flag int, fileMode os.FileMode) (http.File, error)
+	Create(name string) (File, error)
+	Open(name string) (File, error)
+	OpenFile(name string, flag int, fileMode os.FileMode) (File, error)
 	Remove(name string) error
 	RemoveAll(path string) error
 	Rename(oldName, newName string) error

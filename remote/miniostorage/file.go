@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/minio/minio-go/v7"
+	"github.com/tenrok/filestore/remote"
 )
 
 var (
@@ -20,7 +21,7 @@ var (
 	ErrNotSupported = errors.New("doesn't support this operation")
 )
 
-var _ http.File = (*MinioFile)(nil)
+var _ remote.File = (*MinioFile)(nil)
 
 type MinioFile struct {
 	openFlags int

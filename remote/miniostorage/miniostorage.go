@@ -3,7 +3,6 @@ package miniostorage
 import (
 	"context"
 	"errors"
-	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -70,17 +69,17 @@ func (s *MinioStorage) normSeparators(str string) string {
 }
 
 // Create
-func (s *MinioStorage) Create(name string) (http.File, error) {
+func (s *MinioStorage) Create(name string) (remote.File, error) {
 	return s.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0)
 }
 
 // Open
-func (s *MinioStorage) Open(name string) (http.File, error) {
+func (s *MinioStorage) Open(name string) (remote.File, error) {
 	return s.OpenFile(name, os.O_RDONLY, 0)
 }
 
 // OpenFile
-func (s *MinioStorage) OpenFile(name string, flag int, fileMode os.FileMode) (http.File, error) {
+func (s *MinioStorage) OpenFile(name string, flag int, fileMode os.FileMode) (remote.File, error) {
 	if flag&os.O_APPEND != 0 {
 		return nil, errors.New("appending files will lead to trouble")
 	}
