@@ -2,7 +2,7 @@ module github.com/tenrok/filestore
 
 go 1.23.6
 
-require github.com/minio/minio-go/v7 v7.0.92
+require github.com/minio/minio-go/v7 v7.0.94
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
