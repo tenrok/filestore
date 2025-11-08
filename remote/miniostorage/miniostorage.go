@@ -2,20 +2,17 @@ package miniostorage
 
 import (
 	"context"
-	"errors"
-	"net/url"
-	"os"
-	"strconv"
+	"io"
+	"net/http"
+	"path"
 	"strings"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-
 	"github.com/tenrok/filestore/remote"
 )
 
-const defaultFileMode = 0o755
-
+// Убеждаемся в том, что мы всегда реализуем интерфейс remote.Storage.
 var _ remote.Storage = (*MinioStorage)(nil)
 
 func init() {
@@ -23,126 +20,106 @@ func init() {
 }
 
 type MinioStorage struct {
-	ctx       context.Context
-	client    *minio.Client
-	bucket    string
-	separator string
+	ctx    context.Context
+	client *minio.Client
+	cfg    *Config
 }
 
-// NewStorage
 func (s *MinioStorage) NewStorage(ctx context.Context, connString string) (remote.Storage, error) {
-	u, err := url.Parse(connString)
+	cfg, err := NewConfig(connString)
 	if err != nil {
 		return nil, err
 	}
-	queries := u.Query()
-	username, password := getUserPassword(u)
-	token := queries.Get("token")
+
 	opts := &minio.Options{
-		Creds:  credentials.NewStaticV4(username, password, token),
-		Region: "us-east-1",
+		Creds:  credentials.NewStaticV4(cfg.AccessKeyID, cfg.SecretKey, cfg.Token),
+		Region: cfg.Region,
+		Secure: cfg.Secure,
 	}
-	if queries.Has("secure") {
-		secure, err := strconv.ParseBool(queries.Get("secure"))
-		if err != nil {
-			return nil, err
-		}
-		opts.Secure = secure
-	}
-	if queries.Has("region") {
-		opts.Region = queries.Get("region")
-	}
-	client, err := minio.New(u.Host, opts)
+
+	client, err := minio.New(cfg.Endpoint, opts)
 	if err != nil {
 		return nil, err
 	}
+
 	s.ctx = ctx
 	s.client = client
-	s.bucket = u.Path[1:]
-	s.separator = "/"
+	s.cfg = cfg
+
 	return s, nil
 }
 
-// normSeparators will normalize all "\\" and "/" to the provided separator
-func (s *MinioStorage) normSeparators(str string) string {
-	return strings.Replace(strings.Replace(str, "\\", s.separator, -1), "/", s.separator, -1)
+func (s *MinioStorage) Create(name string, opts ...remote.Option) (io.WriteCloser, error) {
+	name = path.Join(s.cfg.Prefix, name)
+
+	return newMinioWriter(s.ctx, s.client, s.cfg.BucketName, name, opts...), nil
 }
 
-// Create
-func (s *MinioStorage) Create(name string) (remote.File, error) {
-	return s.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0)
-}
+func (s *MinioStorage) Open(name string) (http.File, error) {
+	name = path.Join(s.cfg.Prefix, name)
 
-// Open
-func (s *MinioStorage) Open(name string) (remote.File, error) {
-	return s.OpenFile(name, os.O_RDONLY, 0)
-}
-
-// OpenFile
-func (s *MinioStorage) OpenFile(name string, flag int, fileMode os.FileMode) (remote.File, error) {
-	if flag&os.O_APPEND != 0 {
-		return nil, errors.New("appending files will lead to trouble")
+	obj, err := s.client.GetObject(s.ctx, s.cfg.BucketName, name, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, err
 	}
-	name = strings.TrimPrefix(s.normSeparators(name), s.separator)
-	file := NewMinioFile(s.ctx, s, flag, fileMode, name)
-	var err error
-	if flag&os.O_CREATE != 0 {
-		_, err = file.WriteString("")
-	}
-	return file, err
+	return &minioFileWrapper{Object: obj, name: name}, nil
 }
 
-// Remove
 func (s *MinioStorage) Remove(name string) error {
-	name = strings.TrimPrefix(s.normSeparators(name), s.separator)
-	return s.client.RemoveObject(s.ctx, s.bucket, name, minio.RemoveObjectOptions{GovernanceBypass: true})
+	name = path.Join(s.cfg.Prefix, name)
+
+	return s.client.RemoveObject(s.ctx, s.cfg.BucketName, name, minio.RemoveObjectOptions{})
 }
 
-// RemoveAll
-func (s *MinioStorage) RemoveAll(path string) error {
-	path = strings.TrimPrefix(s.normSeparators(path), s.separator)
-	objectsCh := make(chan minio.ObjectInfo)
-	go func() {
-		defer close(objectsCh)
-		opts := minio.ListObjectsOptions{Prefix: path, Recursive: true}
-		for object := range s.client.ListObjects(s.ctx, s.bucket, opts) {
-			if object.Err != nil {
-				panic(object.Err)
-			}
-			objectsCh <- object
-		}
-	}()
-	errorCh := s.client.RemoveObjects(s.ctx, s.bucket, objectsCh, minio.RemoveObjectsOptions{})
-	for e := range errorCh {
-		return errors.New("Failed to remove " + e.ObjectName + ", error: " + e.Err.Error())
+func (s *MinioStorage) Stat(name string) (remote.FileInfo, error) {
+	name = path.Join(s.cfg.Prefix, name)
+
+	info, err := s.client.StatObject(s.ctx, s.cfg.BucketName, name, minio.StatObjectOptions{})
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	return newMinioFileInfo(info), nil
 }
 
-// Rename
-func (s *MinioStorage) Rename(oldName, newName string) error {
-	if oldName == newName {
-		return nil
+func (s *MinioStorage) Exists(name string) (bool, error) {
+	name = path.Join(s.cfg.Prefix, name)
+
+	// Сначала проверяем, является ли путь файлом
+	if ok, err := s.IsFile(name); err == nil && ok {
+		return true, nil
 	}
-	oldName = strings.TrimPrefix(s.normSeparators(oldName), s.separator)
-	newName = strings.TrimPrefix(s.normSeparators(newName), s.separator)
-	src := minio.CopySrcOptions{
-		Bucket: s.bucket,
-		Object: oldName,
-	}
-	dst := minio.CopyDestOptions{
-		Bucket: s.bucket,
-		Object: newName,
-	}
-	if _, err := s.client.CopyObject(s.ctx, dst, src); err != nil {
-		return err
-	}
-	return s.Remove(oldName)
+	// Если не файл, то проверяем, является ли путь каталогом
+	return s.IsDir(name)
 }
 
-// Stat
-func (s *MinioStorage) Stat(name string) (os.FileInfo, error) {
-	name = strings.TrimPrefix(s.normSeparators(name), s.separator)
-	file := NewMinioFile(s.ctx, s, os.O_RDWR, defaultFileMode, name)
-	return file.Stat()
+func (s *MinioStorage) IsDir(name string) (bool, error) {
+	name = path.Join(s.cfg.Prefix, name)
+
+	options := minio.ListObjectsOptions{
+		Prefix:    strings.TrimRight(name, "/") + "/",
+		Recursive: false,
+		MaxKeys:   1,
+	}
+	objectChan := s.client.ListObjects(s.ctx, s.cfg.BucketName, options)
+	object, ok := <-objectChan
+	if !ok {
+		return false, nil
+	}
+	if object.Err != nil {
+		return false, object.Err
+	}
+	return true, nil
+}
+
+func (s *MinioStorage) IsFile(name string) (bool, error) {
+	name = path.Join(s.cfg.Prefix, name)
+
+	_, err := s.client.StatObject(s.ctx, s.cfg.BucketName, name, minio.StatObjectOptions{})
+	if err == nil {
+		return true, nil
+	}
+	if strings.Contains(err.Error(), "The specified key does not exist.") {
+		return false, nil
+	}
+	return false, err
 }

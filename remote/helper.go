@@ -10,7 +10,7 @@ var (
 	ErrEmptyURL = errors.New("URL cannot be empty")
 )
 
-// schemeFromURL returns the scheme from a URL string
+// schemeFromURL возвращает схему из строки URL.
 func schemeFromURL(url string) (string, error) {
 	if url == "" {
 		return "", ErrEmptyURL

@@ -1,6 +1,6 @@
 module github.com/tenrok/filestore
 
-go 1.23.6
+go 1.23.11
 
 require github.com/minio/minio-go/v7 v7.0.95
 

@@ -3,94 +3,31 @@ package miniostorage
 import (
 	"io/fs"
 	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/minio/minio-go/v7"
 )
 
-const folderSize = 42
+// Убеждаемся в том, что мы всегда реализуем интерфейс fs.FileInfo.
+var _ fs.FileInfo = (*minioFileInfo)(nil)
 
-var _ fs.FileInfo = (*MinioFileInfo)(nil)
-
-type MinioFileInfo struct {
-	ETag     string
-	name     string
-	size     int64
-	updated  time.Time
-	isDir    bool
-	fileMode os.FileMode
+// minioFileInfo реализует fs.FileInfo.
+type minioFileInfo struct {
+	info minio.ObjectInfo
 }
 
-// NewFileInfoFromAttrs
-func NewFileInfoFromAttrs(obj minio.ObjectInfo, fileMode os.FileMode) *MinioFileInfo {
-	res := &MinioFileInfo{
-		ETag:     obj.ETag,
-		name:     obj.Key,
-		size:     obj.Size,
-		updated:  obj.LastModified,
-		isDir:    false,
-		fileMode: fileMode,
-	}
-
-	if res.name == "" {
-		// deals with them at the moment
-		//res.name = "folder"
-		res.size = folderSize
-		res.isDir = true
-	}
-
-	return res
+func newMinioFileInfo(info minio.ObjectInfo) *minioFileInfo {
+	return &minioFileInfo{info: info}
 }
 
-// Name
-func (fi *MinioFileInfo) Name() string {
-	return filepath.Base(filepath.FromSlash(fi.name))
-}
+func (f *minioFileInfo) Name() string { return f.info.Key }
 
-// Size
-func (fi *MinioFileInfo) Size() int64 {
-	return fi.size
-}
+func (f *minioFileInfo) Size() int64 { return f.info.Size }
 
-// Mode
-func (fi *MinioFileInfo) Mode() os.FileMode {
-	if fi.IsDir() {
-		return os.ModeDir | fi.fileMode
-	}
-	return fi.fileMode
-}
+func (f *minioFileInfo) Mode() os.FileMode { return 0644 } // MinIO не поддерживает права доступа к файлам. Возвращаем значение по умолчанию.
 
-// ModTime
-func (fi *MinioFileInfo) ModTime() time.Time {
-	return fi.updated
-}
+func (f *minioFileInfo) ModTime() time.Time { return f.info.LastModified.Local() }
 
-// IsDir
-func (fi *MinioFileInfo) IsDir() bool {
-	return fi.isDir
-}
+func (f *minioFileInfo) IsDir() bool { return f.info.Key[len(f.info.Key)-1] == '/' }
 
-// Sys
-func (fi *MinioFileInfo) Sys() any {
-	return nil
-}
-
-type ByName []*MinioFileInfo
-
-// Len
-func (a ByName) Len() int { return len(a) }
-
-// Swap
-func (a ByName) Swap(i, j int) {
-	a[i].name, a[j].name = a[j].name, a[i].name
-	a[i].size, a[j].size = a[j].size, a[i].size
-	a[i].updated, a[j].updated = a[j].updated, a[i].updated
-	a[i].isDir, a[j].isDir = a[j].isDir, a[i].isDir
-}
-
-// Less
-func (a ByName) Less(i, j int) bool {
-	return strings.Compare(a[i].Name(), a[j].Name()) == -1
-}
+func (f *minioFileInfo) Sys() interface{} { return f.info }

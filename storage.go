@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,10 +18,10 @@ import (
 // tmpfileName используется в качестве имени временного файла при генерации ошибок
 const tmpfileName = "<temporary file>"
 
-// Store описывает хранилище файлов.
-type Store struct {
-	dir         string
-	permissions os.FileMode
+// LocalStorage описывает хранилище файлов.
+type LocalStorage struct {
+	rootDir string
+	perm    os.FileMode
 
 	mutexes struct {
 		sync.Mutex
@@ -29,40 +30,38 @@ type Store struct {
 	}
 }
 
-type StoreOption func(*Store)
+type LocalStorageOption func(*LocalStorage)
 
 // WithPermissions
-func WithPermissions(permissions os.FileMode) StoreOption {
-	return func(store *Store) {
-		store.permissions = permissions
+func WithPermissions(perm os.FileMode) LocalStorageOption {
+	return func(s *LocalStorage) {
+		s.perm = perm
 	}
 }
 
 // FileInfo описывает информацию о сохраненном файле.
 type FileInfo struct {
-	Location string `json:"location"`
-	Name     string `json:"name"`
-	Mimetype string `json:"mimetype"`
-	Size     int64  `json:"size"`
-	CRC32    uint32 `json:"crc32"`
-	MD5      string `json:"md5"`
+	Location string // @deprecated
+	Path     string
+	Name     string
+	Mimetype string
+	Size     int64
+	CRC32    uint32
+	MD5      string
 }
 
-// NewStore открывает и возвращает хранилище файлов.
-func NewStore(dir string, opts ...StoreOption) (*Store, error) {
-	s := &Store{
-		dir:         dir,
-		permissions: 0700,
-	}
+// NewLocalStorage открывает и возвращает хранилище файлов.
+func NewLocalStorage(rootDir string, opts ...LocalStorageOption) (*LocalStorage, error) {
+	s := &LocalStorage{}
+	s.rootDir = rootDir
+	s.perm = 0700
 
 	for _, opt := range opts {
-		if opt != nil {
-			opt(s)
-		}
+		opt(s)
 	}
 
 	// Создаём каталог, если он ещё не создан
-	if err := os.MkdirAll(s.dir, s.permissions); err != nil {
+	if err := os.MkdirAll(s.rootDir, s.perm); err != nil {
 		return nil, err
 	}
 
@@ -70,9 +69,9 @@ func NewStore(dir string, opts ...StoreOption) (*Store, error) {
 }
 
 // Create сохраняет файл в хранилище. В качестве имени файла используется комбинация из двух хешей.
-func (s *Store) Create(r io.Reader) (*FileInfo, error) {
+func (s *LocalStorage) Create(r io.Reader) (*FileInfo, error) {
 	// Создаём временный файл в корневом каталоге
-	tmpfile, err := os.CreateTemp(s.dir, "~tmp")
+	tmpfile, err := os.CreateTemp(s.rootDir, "~tmp")
 	if err != nil {
 		err.(*os.PathError).Path = tmpfileName // Подмениваем имя файла
 		return nil, err
@@ -104,7 +103,8 @@ func (s *Store) Create(r io.Reader) (*FileInfo, error) {
 	sumMD5 := hashMD5.Sum(nil)
 	name := base32.StdEncoding.EncodeToString(append(hashCRC32.Sum(nil), sumMD5...))
 	fi := &FileInfo{
-		Location: s.GetFullName(name),
+		Location: s.GetPath(name),
+		Path:     s.GetPath(name),
 		Name:     name,
 		Mimetype: mimetype,
 		Size:     size,
@@ -122,18 +122,18 @@ func (s *Store) Create(r io.Reader) (*FileInfo, error) {
 
 	// Если файл уже существует, то просто обновляем его время создания
 	now := time.Now()
-	if err := os.Chtimes(fi.Location, now, now); err == nil {
+	if err := os.Chtimes(fi.Path, now, now); err == nil {
 		return fi, nil // Возвращаем информацию о файле, временный файл будет автоматически удален
 	}
 
 	// Если такого файла нет, то создаем для него каталог
-	if err := os.MkdirAll(filepath.Dir(fi.Location), s.permissions); err != nil {
+	if err := os.MkdirAll(filepath.Dir(fi.Path), s.perm); err != nil {
 		err.(*os.PathError).Path = fi.Name
 		return nil, err
 	}
 
 	// Перемещаем временный файл в этот каталог
-	if err := os.Rename(tmpfile.Name(), fi.Location); err != nil {
+	if err := os.Rename(tmpfile.Name(), fi.Path); err != nil {
 		if _, ok := err.(*os.PathError); ok {
 			err.(*os.PathError).Path = fi.Name
 		}
@@ -145,9 +145,9 @@ func (s *Store) Create(r io.Reader) (*FileInfo, error) {
 }
 
 // Open открывает файл из каталога.
-func (s *Store) Open(name string) (*os.File, error) {
+func (s *LocalStorage) Open(name string) (*os.File, error) {
 	// Полное имя для доступа к файлу
-	fullName := s.GetFullName(name)
+	fullName := s.GetPath(name)
 	if fullName == "" {
 		return nil, os.ErrNotExist
 	}
@@ -181,13 +181,13 @@ func (s *Store) Open(name string) (*os.File, error) {
 }
 
 // Remove удаляет файл из хранилища.
-func (s *Store) Remove(name string) error {
+func (s *LocalStorage) Remove(name string) error {
 	mu := s.getMutex(name)
 	mu.Lock()
 	defer mu.Unlock()
 
 	// Полное имя для доступа к файлу
-	fullName := s.GetFullName(name)
+	fullName := s.GetPath(name)
 	if fullName == "" {
 		return os.ErrNotExist
 	}
@@ -209,10 +209,10 @@ func (s *Store) Remove(name string) error {
 }
 
 // Clean удаляет старые файлы, к которым не обращались больше заданного времени.
-func (s *Store) Clean(lifetime time.Duration) error {
+func (s *LocalStorage) Clean(lifetime time.Duration) error {
 	// Удаляем вообще все файлы, если время жизни не задано
 	if lifetime <= 0 {
-		files, err := filepath.Glob(filepath.Join(s.dir, "*"))
+		files, err := filepath.Glob(filepath.Join(s.rootDir, "*"))
 		if err != nil {
 			return err
 		}
@@ -226,7 +226,7 @@ func (s *Store) Clean(lifetime time.Duration) error {
 	// Вычисляем крайнюю дату валидности файлов
 	valid := time.Now().Add(-lifetime)
 
-	err := filepath.Walk(s.dir,
+	err := filepath.Walk(s.rootDir,
 		func(filename string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
@@ -262,7 +262,7 @@ func (s *Store) Clean(lifetime time.Duration) error {
 }
 
 // getMutex
-func (s *Store) getMutex(name string) *sync.Mutex {
+func (s *LocalStorage) getMutex(name string) *sync.Mutex {
 	s.mutexes.Do(func() { s.mutexes.m = make(map[string]*sync.Mutex) })
 
 	s.mutexes.Lock()
@@ -277,16 +277,22 @@ func (s *Store) getMutex(name string) *sync.Mutex {
 }
 
 // GetFullName возвращает полный путь к файлу в хранилище.
-func (s *Store) GetFullName(name string) string {
+//
+// Deprecated: GetFullName is no longer recommended. Use GetPath instead.
+func (s *LocalStorage) GetFullName(name string) string { return s.GetPath(name) }
+
+// GetPath возвращает полный путь к файлу в хранилище.
+func (s *LocalStorage) GetPath(name string) string {
+	name = strings.TrimPrefix(name, "/")
 	if len(name) < 27 {
 		return ""
 	}
-	return filepath.Join(s.dir, name[:1], name[1:3], name[3:])
+	return filepath.Join(s.rootDir, name[:1], name[1:3], name[3:])
 }
 
 // IsExists проверяет: существует ли файл в хранилище?
-func (s *Store) IsExists(name string) bool {
-	fullName := s.GetFullName(name)
+func (s *LocalStorage) IsExists(name string) bool {
+	fullName := s.GetPath(name)
 	if fullName == "" {
 		return false
 	}

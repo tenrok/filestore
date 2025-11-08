@@ -7,10 +7,11 @@ import (
 	"github.com/tenrok/filestore/remote"
 )
 
+// Убеждаемся в том, что мы всегда реализуем интерфейс http.FileSystem.
 var _ http.FileSystem = (*HttpFS)(nil)
 
 type HttpFS struct {
-	store         *Store
+	localStorage  *LocalStorage
 	remoteStorage remote.Storage
 }
 
@@ -18,19 +19,20 @@ type HttpFSOption func(*HttpFS)
 
 // WithRemoteStorage
 func WithRemoteStorage(storage remote.Storage) HttpFSOption {
-	return func(httpFS *HttpFS) {
-		httpFS.remoteStorage = storage
+	return func(f *HttpFS) {
+		f.remoteStorage = storage
 	}
 }
 
-// NewHttpFS
-func NewHttpFS(dir string, opts ...HttpFSOption) (*HttpFS, error) {
-	store, err := NewStore(dir)
+// NewHttpFS создаёт новый экземпляр файловой системы.
+func NewHttpFS(rootDir string, opts ...HttpFSOption) (*HttpFS, error) {
+	localStorage, err := NewLocalStorage(rootDir)
 	if err != nil {
 		return nil, err
 	}
 
-	f := &HttpFS{store: store}
+	f := &HttpFS{}
+	f.localStorage = localStorage
 
 	for _, opt := range opts {
 		if opt != nil {
@@ -41,18 +43,26 @@ func NewHttpFS(dir string, opts ...HttpFSOption) (*HttpFS, error) {
 	return f, nil
 }
 
-// Open
+// Open реализует метод http.FileSystem.
 func (f *HttpFS) Open(name string) (http.File, error) {
-	n := strings.TrimPrefix(name, "/")
-
+	name = strings.TrimPrefix(name, "/")
 	if f.remoteStorage != nil {
 		return f.remoteStorage.Open(name)
 	}
-
-	return f.store.Open(n)
+	return f.localStorage.Open(name)
 }
 
-// RemoteStorage
-func (f *HttpFS) RemoteStorage() remote.Storage {
-	return f.remoteStorage
+// Remove удаляет файл.
+func (f *HttpFS) Remove(name string) error {
+	name = strings.TrimPrefix(name, "/")
+	if f.remoteStorage != nil {
+		return f.remoteStorage.Remove(name)
+	}
+	return f.localStorage.Remove(name)
 }
+
+// LocalStorage возвращает указатель на локальное хранилище.
+func (f *HttpFS) LocalStorage() *LocalStorage { return f.localStorage }
+
+// RemoteStorage возвращает указатель на удалённое хранилище.
+func (f *HttpFS) RemoteStorage() remote.Storage { return f.remoteStorage }
