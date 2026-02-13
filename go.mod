@@ -4,7 +4,7 @@ go 1.24.0
 
 replace github.com/tenrok/filestore/remote => ./remote
 
-require github.com/minio/minio-go/v7 v7.0.97
+require github.com/minio/minio-go/v7 v7.0.98
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
@@ -20,6 +20,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rs/xid v1.6.0 // indirect
 	github.com/tinylib/msgp v1.6.1 // indirect
+	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/crypto v0.46.0 // indirect
 	golang.org/x/net v0.48.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
