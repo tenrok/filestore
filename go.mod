@@ -1,10 +1,10 @@
 module github.com/tenrok/filestore
 
-go 1.24.0
+go 1.25
 
 replace github.com/tenrok/filestore/remote => ./remote
 
-require github.com/minio/minio-go/v7 v7.0.98
+require github.com/minio/minio-go/v7 v7.0.99
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
