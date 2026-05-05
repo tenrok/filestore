@@ -393,16 +393,20 @@ func (s *LocalStorage) GetFullPath(name string) (string, error) {
 }
 
 // IsExists проверяет существование файла.
-func (s *LocalStorage) IsExists(name string) bool {
+func (s *LocalStorage) IsExists(name string) (bool, error) {
 	fullPath, err := s.GetFullPath(name)
 	if err != nil {
-		return false
+		return false, err
 	}
 
 	fi, err := os.Stat(fullPath)
 	if err != nil {
-		return false
+		return false, err
 	}
 
-	return !fi.IsDir()
+	if fi.IsDir() {
+		return false, fmt.Errorf("The specified file is a directory")
+	}
+
+	return true, nil
 }

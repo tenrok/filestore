@@ -32,14 +32,8 @@ type Storage interface {
 	// Stat получает информацию о файле/каталоге.
 	Stat(name string) (FileInfo, error)
 
-	// Exists определяет, существует ли файл или каталог.
-	Exists(name string) (bool, error)
-
-	// IsDir определяет, является ли путь каталогом.
-	IsDir(name string) (bool, error)
-
-	// IsFile определяет, является ли путь файлом.
-	IsFile(name string) (bool, error)
+	// IsExists определяет, существует ли файл.
+	IsExists(name string) (bool, error)
 
 	Uploader() Uploader
 }

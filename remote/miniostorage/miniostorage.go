@@ -5,7 +5,6 @@ import (
 	"io"
 	"net/http"
 	"path"
-	"strings"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -81,45 +80,13 @@ func (s *MinioStorage) Stat(name string) (remote.FileInfo, error) {
 	return newMinioFileInfo(info), nil
 }
 
-func (s *MinioStorage) Exists(name string) (bool, error) {
-	name = path.Join(s.cfg.Prefix, name)
-
-	// Сначала проверяем, является ли путь файлом
-	if ok, err := s.IsFile(name); err == nil && ok {
-		return true, nil
-	}
-	// Если не файл, то проверяем, является ли путь каталогом
-	return s.IsDir(name)
-}
-
-func (s *MinioStorage) IsDir(name string) (bool, error) {
-	name = path.Join(s.cfg.Prefix, name)
-
-	options := minio.ListObjectsOptions{
-		Prefix:    strings.TrimRight(name, "/") + "/",
-		Recursive: false,
-		MaxKeys:   1,
-	}
-	objectChan := s.client.ListObjects(s.ctx, s.cfg.BucketName, options)
-	object, ok := <-objectChan
-	if !ok {
-		return false, nil
-	}
-	if object.Err != nil {
-		return false, object.Err
-	}
-	return true, nil
-}
-
-func (s *MinioStorage) IsFile(name string) (bool, error) {
+func (s *MinioStorage) IsExists(name string) (bool, error) {
 	name = path.Join(s.cfg.Prefix, name)
 
 	_, err := s.client.StatObject(s.ctx, s.cfg.BucketName, name, minio.StatObjectOptions{})
-	if err == nil {
-		return true, nil
+	if err != nil {
+		return false, err
 	}
-	if strings.Contains(err.Error(), "The specified key does not exist.") {
-		return false, nil
-	}
-	return false, err
+
+	return true, nil
 }
