@@ -12,8 +12,14 @@ type FileInfo interface {
 	Mode() os.FileMode
 	ModTime() time.Time
 	IsDir() bool
-	Sys() interface{}
+	Sys() any
 }
 
 // Metadata метаданные файла
 type Metadata map[string]any
+
+// ListResult содержит страницу файлов и токен для следующей страницы.
+type ListResult struct {
+	Files     []FileInfo
+	NextToken string // пустая строка, если больше нет страниц
+}

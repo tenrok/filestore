@@ -1,13 +1,14 @@
 package filestore
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
 	"github.com/tenrok/filestore/remote"
 )
 
-// Убеждаемся в том, что мы всегда реализуем интерфейс http.FileSystem.
+// Проверка на этапе компиляции, что тип реализует http.FileSystem.
 var _ http.FileSystem = (*HttpFS)(nil)
 
 type HttpFS struct {
@@ -66,3 +67,11 @@ func (f *HttpFS) LocalStorage() *LocalStorage { return f.localStorage }
 
 // RemoteStorage возвращает указатель на удалённое хранилище.
 func (f *HttpFS) RemoteStorage() remote.Storage { return f.remoteStorage }
+
+// List
+func (f *HttpFS) List(ctx context.Context, prefix string, limit int, token string) (*remote.ListResult, error) {
+	if f.remoteStorage != nil {
+		return f.remoteStorage.List(ctx, prefix, limit, token)
+	}
+	return f.localStorage.List(ctx, prefix, limit, token)
+}

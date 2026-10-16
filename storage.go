@@ -13,26 +13,37 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tenrok/filestore/remote"
 )
 
 // tmpfileName используется в качестве имени временного файла при генерации ошибок
 const tmpfileName = "<temporary file>"
 
-// минимальная длина имени файла, необходимая для разбиения на подкаталоги
-const minNameLen = 27
+// ContentNameLen — длина имени, которую выдаёт ContentName (Base32(20 байт) = 32 символа).
+const ContentNameLen = 32
+
+// ErrIsDirectory — файл по имени существует, но это директория.
+// Возникает только при внешнем вмешательстве в content-addressed раскладку.
+var ErrIsDirectory = errors.New("is a directory")
 
 // LocalStorage описывает хранилище файлов.
 type LocalStorage struct {
 	rootDir string
 	perm    os.FileMode
 
-	// защита для map мьютексов
-	mu        sync.Mutex
-	once      sync.Once
-	fileMutex map[string]*sync.Mutex // мьютекс на имя файла
+	mu    sync.Mutex
+	locks map[string]*lockEntry
+}
+
+// lockEntry — мьютекс с подсчётом ссылок для одного имени.
+type lockEntry struct {
+	mu   sync.Mutex
+	refs int
 }
 
 type LocalStorageOption func(*LocalStorage)
@@ -44,10 +55,10 @@ func WithPermissions(perm os.FileMode) LocalStorageOption {
 	}
 }
 
-// FileInfo описывает информацию о сохраненном файле.
+// FileInfo описывает информацию о сохранённом файле.
 type FileInfo struct {
-	Path     string // полный путь внутри хранилища
-	Name     string // уникальное имя файла
+	Path     string // Полный путь внутри хранилища
+	Name     string // Уникальное имя файла
 	Mimetype string
 	Size     int64
 	CRC32    uint32
@@ -56,13 +67,15 @@ type FileInfo struct {
 
 // NewLocalStorage открывает и возвращает хранилище файлов.
 func NewLocalStorage(rootDir string, opts ...LocalStorageOption) (*LocalStorage, error) {
-	s := &LocalStorage{}
+	s := &LocalStorage{
+		perm:  0700,
+		locks: make(map[string]*lockEntry),
+	}
 	s.rootDir = rootDir
-	s.perm = 0700
-	s.fileMutex = make(map[string]*sync.Mutex)
-
 	for _, opt := range opts {
-		opt(s)
+		if opt != nil {
+			opt(s)
+		}
 	}
 
 	// Очищаем путь и делаем его абсолютным для корректной проверки безопасности
@@ -80,62 +93,61 @@ func NewLocalStorage(rootDir string, opts ...LocalStorageOption) (*LocalStorage,
 	return s, nil
 }
 
-// getMutex возвращает мьютекс для имени файла, создавая его при необходимости.
-func (s *LocalStorage) getMutex(name string) *sync.Mutex {
-	s.once.Do(func() {
-		// инициализация уже выполнена в NewLocalStorage, но оставляем для безопасности
-		if s.fileMutex == nil {
-			s.fileMutex = make(map[string]*sync.Mutex)
-		}
-	})
-
+// acquire блокирует имя и возвращает функцию освобождения.
+// Мьютекс удаляется из map только когда все ожидающие освободят его.
+func (s *LocalStorage) acquire(name string) func() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	mu, ok := s.fileMutex[name]
+	e, ok := s.locks[name]
 	if !ok {
-		mu = &sync.Mutex{}
-		s.fileMutex[name] = mu
+		e = &lockEntry{}
+		s.locks[name] = e
 	}
-	return mu
-}
-
-// releaseMutex удаляет мьютекс из map после использования (вызывать после Unlock).
-func (s *LocalStorage) releaseMutex(name string) {
-	s.mu.Lock()
-	delete(s.fileMutex, name)
+	e.refs++
 	s.mu.Unlock()
+
+	e.mu.Lock()
+	return func() {
+		e.mu.Unlock()
+		s.mu.Lock()
+		e.refs--
+		if e.refs == 0 {
+			delete(s.locks, name)
+		}
+		s.mu.Unlock()
+	}
 }
 
-// safePath проверяет, что путь не выходит за пределы rootDir, и возвращает очищенный путь.
+// safePath проверяет, что путь не выходит за пределы rootDir.
+// Пустой путь возвращает сам rootDir (пригодно для List с пустым prefix).
 func (s *LocalStorage) safePath(subPath string) (string, error) {
-	// Убираем начальные разделители и ".." попытки
-	clean := filepath.Clean(strings.TrimPrefix(subPath, "/"))
-
-	// Запрещаем пустые и слишком короткие имена
-	if clean == "" || clean == "." || clean == ".." {
-		return "", os.ErrNotExist
+	clean := filepath.Clean(strings.TrimLeft(subPath, "/"))
+	if clean == "." || clean == "" {
+		return s.rootDir, nil
 	}
-
-	full := filepath.Join(s.rootDir, clean)
-
-	// Проверяем, что итоговый путь всё ещё внутри rootDir
-	absFull, err := filepath.Abs(full)
-	if err != nil {
-		return "", err
-	}
-
-	if !strings.HasPrefix(absFull, s.rootDir+string(os.PathSeparator)) && absFull != s.rootDir {
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
 		return "", fmt.Errorf("%w: path traversal attempt", os.ErrPermission)
 	}
 
-	return absFull, nil
+	full := filepath.Join(s.rootDir, clean)
+	abs, err := filepath.Abs(full)
+	if err != nil {
+		return "", err
+	}
+	if abs != s.rootDir && !strings.HasPrefix(abs, s.rootDir+string(os.PathSeparator)) {
+		return "", fmt.Errorf("%w: path traversal attempt", os.ErrPermission)
+	}
+	return abs, nil
 }
 
-// Create сохраняет файл в хранилище. В качестве имени файла используется комбинация из двух хешей.
+// Create сохраняет поток в хранилище и возвращает FileInfo.
+// Имя файла — Base32(CRC32_BE || MD5), т.е. content-addressed.
+// При отмене контекста возвращается ctx.Err() без гонки с горутиной записи.
 func (s *LocalStorage) Create(ctx context.Context, r io.Reader) (*FileInfo, error) {
 	if r == nil {
 		return nil, errors.New("reader is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// Создаём временный файл в корневом каталоге
@@ -143,181 +155,192 @@ func (s *LocalStorage) Create(ctx context.Context, r io.Reader) (*FileInfo, erro
 	if err != nil {
 		return nil, s.wrapPathError(err, tmpfileName)
 	}
-	defer func() {
-		tmpfile.Close()
-		os.Remove(tmpfile.Name())
-	}()
+	tmpName := tmpfile.Name()
+	cleanup := func() {
+		_ = tmpfile.Close()
+		_ = os.Remove(tmpName)
+	}
 
 	// Копируем содержимое во временный файл
 	bufferReader := bufio.NewReaderSize(r, 4<<10)
+	if err := ctx.Err(); err != nil {
+		cleanup()
+		return nil, err
+	}
 
 	// Пытаемся определить MIME-тип содержимого
 	data, err := bufferReader.Peek(512)
-	if err != nil && err != io.EOF {
+	if err != nil && !errors.Is(err, io.EOF) {
+		cleanup()
 		return nil, s.wrapPathError(err, tmpfileName)
 	}
 	mimetype := http.DetectContentType(data)
 
 	// Одновременно с сохранением в файл считаем две хеш-суммы
-	hashCRC32, hashMD5 := crc32.NewIEEE(), md5.New()
+	hashCRC32 := crc32.NewIEEE()
+	hashMD5 := md5.New()
 	multiWriter := io.MultiWriter(tmpfile, hashCRC32, hashMD5)
 
-	type copyResult struct {
-		size int64
-		err  error
+	size, err := copyWithContext(ctx, multiWriter, bufferReader)
+	if err != nil {
+		cleanup()
+		return nil, s.wrapPathError(err, tmpfileName)
 	}
-	done := make(chan copyResult, 1)
-	go func() {
-		size, err := bufferReader.WriteTo(multiWriter)
-		done <- copyResult{size, err}
-	}()
 
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case res := <-done:
-		if res.err != nil {
-			return nil, s.wrapPathError(res.err, tmpfileName)
-		}
-		// Формируем информацию о файле
-		sumMD5 := hashMD5.Sum(nil)
-		name := base32.StdEncoding.EncodeToString(append(hashCRC32.Sum(nil), sumMD5...))
-		fi := &FileInfo{
-			Path:     s.GetRelativePath(name),
-			Name:     name,
-			Mimetype: mimetype,
-			Size:     res.size,
-			CRC32:    hashCRC32.Sum32(),
-			MD5:      hex.EncodeToString(sumMD5),
-		}
+	if err := tmpfile.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return nil, s.wrapPathError(err, tmpfileName)
+	}
 
-		// Закрываем временный файл
-		if err := tmpfile.Close(); err != nil {
-			return nil, s.wrapPathError(err, tmpfileName)
-		}
+	// Формируем информацию о файле
+	sumMD5 := hashMD5.Sum(nil)
+	var nameBuf [20]byte
+	copy(nameBuf[0:4], hashCRC32.Sum(nil))
+	copy(nameBuf[4:20], sumMD5)
+	name := base32.StdEncoding.EncodeToString(nameBuf[:])
 
-		fullPath, err := s.safePath(fi.Path)
-		if err != nil {
-			return nil, err
-		}
+	fi := &FileInfo{
+		Path:     s.GetRelativePath(name),
+		Name:     name,
+		Mimetype: mimetype,
+		Size:     size,
+		CRC32:    hashCRC32.Sum32(),
+		MD5:      hex.EncodeToString(sumMD5),
+	}
 
-		// Если файл уже существует, то просто обновляем его время создания
-		now := time.Now()
-		if err := os.Chtimes(fullPath, now, now); err == nil {
-			return fi, nil
-		} else if !os.IsNotExist(err) {
-			// Другая ошибка (например, permission denied) – не можем перезаписать
-			return nil, s.wrapPathError(err, name)
-		}
+	fullPath, err := s.safePath(fi.Path)
+	if err != nil {
+		_ = os.Remove(tmpName)
+		return nil, err
+	}
 
-		// Если такого файла нет, то создаем для него каталоги
-		if err := os.MkdirAll(filepath.Dir(fullPath), s.perm); err != nil {
-			return nil, s.wrapPathError(err, name)
-		}
-
-		// Перемещаем временный файл
-		if err := os.Rename(tmpfile.Name(), fullPath); err != nil {
-			return nil, s.wrapPathError(err, name)
-		}
-
+	// Дедупликация: если файл уже есть — только обновляем atime, mtime сохраняем.
+	if existing, statErr := os.Stat(fullPath); statErr == nil {
+		_ = os.Remove(tmpName)
+		_ = os.Chtimes(fullPath, time.Now(), existing.ModTime())
 		return fi, nil
+	} else if !os.IsNotExist(statErr) {
+		// Другая ошибка (например, permission denied) – не можем перезаписать
+		_ = os.Remove(tmpName)
+		return nil, s.wrapPathError(statErr, name)
+	}
+
+	// Если такого файла нет, то создаем для него каталоги
+	if err := os.MkdirAll(filepath.Dir(fullPath), s.perm); err != nil {
+		_ = os.Remove(tmpName)
+		return nil, s.wrapPathError(err, name)
+	}
+
+	// Перемещаем временный файл
+	if err := os.Rename(tmpName, fullPath); err != nil {
+		_ = os.Remove(tmpName)
+		return nil, s.wrapPathError(err, name)
+	}
+	return fi, nil
+}
+
+// copyWithContext — синхронная замена io.Copy, реагирует на отмену контекста.
+func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+	buf := make([]byte, 32*1024)
+	var written int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return written, werr
+			}
+			written += int64(n)
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return written, nil
+			}
+			return written, rerr
+		}
 	}
 }
 
-// Open открывает файл из хранилища.
+// Open открывает файл из хранилища. mtime не меняется; обновляется только atime.
 func (s *LocalStorage) Open(name string) (*os.File, error) {
 	// Полное имя для доступа к файлу
 	fullPath, err := s.GetFullPath(name)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, os.ErrNotExist
-		}
 		return nil, err
 	}
 
 	// Открываем файл
 	file, err := os.Open(fullPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, os.ErrNotExist
+		}
 		return nil, s.wrapPathError(err, name)
 	}
 
 	// Получаем информацию о файле и проверяем, что это не каталог
 	fi, err := file.Stat()
 	if err != nil {
-		file.Close()
+		_ = file.Close()
 		return nil, s.wrapPathError(err, name)
 	}
 
 	// Возвращаем ошибку, если это каталог, а не файл
 	if fi.IsDir() {
-		file.Close()
-		return nil, &os.PathError{Op: "open", Path: name, Err: os.ErrPermission}
+		_ = file.Close()
+		return nil, &os.PathError{Op: "open", Path: name, Err: ErrIsDirectory}
 	}
 
-	// Обновляем время доступа (ошибку игнорируем, это не критично)
-	now := time.Now()
-	_ = os.Chtimes(fullPath, now, now)
+	// Обновляем atime с сохранением mtime (ошибку игнорируем, это не критично).
+	_ = os.Chtimes(fullPath, time.Now(), fi.ModTime())
 	return file, nil
 }
 
 // Remove удаляет файл из хранилища.
 func (s *LocalStorage) Remove(name string) error {
-	mu := s.getMutex(name)
-	mu.Lock()
-	defer func() {
-		mu.Unlock()
-		s.releaseMutex(name)
-	}()
+	release := s.acquire(name)
+	defer release()
 
 	fullPath, err := s.GetFullPath(name)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return os.ErrNotExist
-		}
 		return err
 	}
-
 	if err := os.Remove(fullPath); err != nil {
+		if os.IsNotExist(err) {
+			return os.ErrNotExist
+		}
 		return s.wrapPathError(err, name)
 	}
-
-	// Удаляем пустые родительские каталоги, но не выше rootDir
 	s.removeEmptyParents(fullPath)
 	return nil
 }
 
-// removeEmptyParents поднимается вверх по дереву каталогов, удаляя пустые,
-// пока не дойдёт до rootDir или не встретит непустой каталог.
+// removeEmptyParents поднимается вверх по дереву, удаляя пустые каталоги до rootDir.
 func (s *LocalStorage) removeEmptyParents(path string) {
 	dir := filepath.Dir(path)
-	for dir != s.rootDir && dir != "." && dir != "/" {
-		// Пытаемся удалить каталог
+	for dir != s.rootDir && dir != "." && dir != string(os.PathSeparator) {
 		if err := os.Remove(dir); err != nil {
-			break // не пустой или ошибка прав
+			return
 		}
 		dir = filepath.Dir(dir)
 	}
 }
 
-// Clean удаляет старые файлы, к которым не обращались больше заданного времени.
-// Если lifetime <= 0, удаляет все файлы.
+// Clean удаляет файлы, к которым не обращались дольше lifetime.
+// lifetime <= 0 — удаляет всё содержимое rootDir.
 func (s *LocalStorage) Clean(ctx context.Context, lifetime time.Duration) error {
 	if lifetime <= 0 {
-		// Удаляем всё содержимое rootDir, но не саму директорию
 		entries, err := os.ReadDir(s.rootDir)
 		if err != nil {
 			return err
 		}
 		for _, entry := range entries {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
+			if err := ctx.Err(); err != nil {
+				return err
 			}
-			if err := os.RemoveAll(filepath.Join(s.rootDir, entry.Name())); err != nil {
-				// Логируем, но продолжаем (по аналогии с оригиналом)
-				continue
-			}
+			_ = os.RemoveAll(filepath.Join(s.rootDir, entry.Name()))
 		}
 		return nil
 	}
@@ -325,74 +348,65 @@ func (s *LocalStorage) Clean(ctx context.Context, lifetime time.Duration) error 
 	valid := time.Now().Add(-lifetime)
 	err := filepath.Walk(s.rootDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil // игнорируем ошибки доступа к файлу
+			return nil
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-
 		if info.IsDir() || info.ModTime().After(valid) {
 			return nil
 		}
-
-		// Получаем имя файла относительно rootDir
-		rel, err := filepath.Rel(s.rootDir, path)
-		if err != nil {
+		rel, relErr := filepath.Rel(s.rootDir, path)
+		if relErr != nil {
 			return nil
 		}
+		flat := strings.ReplaceAll(rel, string(os.PathSeparator), "")
 
-		// Имя файла в нашей терминологии — это путь без rootDir
-		fileName := strings.ReplaceAll(rel, string(os.PathSeparator), "") // упрощённо, но для блокировки нужно исходное имя
-
-		// Блокируем файл на время удаления
-		mu := s.getMutex(fileName)
-		mu.Lock()
-		defer mu.Unlock()
+		release := s.acquire(flat)
+		defer release()
 
 		if err := os.Remove(path); err != nil {
-			return nil // игнорируем ошибку удаления
+			return nil
 		}
 		s.removeEmptyParents(path)
 		return nil
 	})
-
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
 }
 
-// wrapPathError безопасно заменяет путь в ошибке, если она является *os.PathError.
+// wrapPathError безопасно заменяет путь в *os.PathError.
 func (s *LocalStorage) wrapPathError(err error, name string) error {
-	if pe, ok := err.(*os.PathError); ok {
-		pe.Path = name
-		return pe
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		return &os.PathError{Op: pe.Op, Path: name, Err: pe.Err}
 	}
 	return err
 }
 
-// GetRelativePath возвращает относительный путь к файлу в хранилище (без учёта rootDir).
+// GetRelativePath возвращает путь внутри хранилища: A/BC/DEF...
 func (s *LocalStorage) GetRelativePath(name string) string {
-	name = strings.TrimPrefix(name, "/")
-	if len(name) < minNameLen {
+	name = strings.TrimLeft(name, "/")
+	if len(name) < ContentNameLen {
 		return ""
 	}
-	// Раскладываем по подкаталогам: первая буква, вторая+третья, остальное
 	return filepath.Join(name[:1], name[1:3], name[3:])
 }
 
-// GetFullPath возвращает полный путь к файлу в хранилище.
+// GetFullPath возвращает абсолютный путь к файлу.
 func (s *LocalStorage) GetFullPath(name string) (string, error) {
-	relPath := s.GetRelativePath(name)
-	if relPath == "" {
+	rel := s.GetRelativePath(name)
+	if rel == "" {
 		return "", fmt.Errorf("invalid file name: %s", name)
 	}
-	return s.safePath(relPath)
+	return s.safePath(rel)
 }
 
 // IsExists проверяет существование файла.
+// (false, nil) — файла нет.
+// (false, err) — ошибка доступа/IO либо по имени лежит директория.
 func (s *LocalStorage) IsExists(name string) (bool, error) {
 	fullPath, err := s.GetFullPath(name)
 	if err != nil {
@@ -401,12 +415,77 @@ func (s *LocalStorage) IsExists(name string) (bool, error) {
 
 	fi, err := os.Stat(fullPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
 		return false, err
 	}
 
 	if fi.IsDir() {
-		return false, fmt.Errorf("The specified file is a directory")
+		return false, &os.PathError{Op: "stat", Path: name, Err: ErrIsDirectory}
+	}
+	return true, nil
+}
+
+// List возвращает страницу файлов.
+// prefix — префикс контент-адресуемого имени; пустая строка — все файлы.
+// limit <= 0 — без ограничения (возвращает всё, начиная с offset).
+// Токен — числовой offset.
+func (s *LocalStorage) List(ctx context.Context, prefix string, limit int, token string) (*remote.ListResult, error) {
+	var allFiles []remote.FileInfo
+
+	walkErr := filepath.Walk(s.rootDir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(s.rootDir, p)
+		if relErr != nil {
+			return nil
+		}
+		flat := strings.ReplaceAll(rel, string(os.PathSeparator), "")
+		if prefix != "" && !strings.HasPrefix(flat, prefix) {
+			return nil
+		}
+		allFiles = append(allFiles, newLocalFileInfo(flat, info))
+		return nil
+	})
+	if walkErr != nil && !os.IsNotExist(walkErr) {
+		return nil, walkErr
 	}
 
-	return true, nil
+	offset := 0
+	if token != "" {
+		v, perr := strconv.Atoi(token)
+		if perr != nil || v < 0 {
+			return nil, fmt.Errorf("invalid token: %q", token)
+		}
+		offset = v
+	}
+	if offset > len(allFiles) {
+		offset = len(allFiles)
+	}
+
+	if limit <= 0 {
+		limit = len(allFiles) - offset
+	}
+	end := offset + limit
+	if end > len(allFiles) {
+		end = len(allFiles)
+	}
+
+	nextToken := ""
+	if end < len(allFiles) {
+		nextToken = strconv.Itoa(end)
+	}
+
+	return &remote.ListResult{
+		Files:     allFiles[offset:end],
+		NextToken: nextToken,
+	}, nil
 }

@@ -36,6 +36,8 @@ type Storage interface {
 	IsExists(name string) (bool, error)
 
 	Uploader() Uploader
+
+	List(ctx context.Context, prefix string, limit int, token string) (*ListResult, error)
 }
 
 // NewStorage создаёт новый экземпляр удаленного хранилища.
